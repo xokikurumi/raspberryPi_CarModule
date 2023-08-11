@@ -1,140 +1,201 @@
 #!usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import serial
-import micropyGPS
-import threading
 import time
+import serial
+import smbus
+
+import re
 import RPi.GPIO as GPIO
 import math
 import DB
+import micropyGPS
+from geopy.distance import geodesic
+import threading
 
 
-######################################################
-# TODO
-# 1. GPS情報から緯度経度,日時情報を保存しログへ(NMEA)
-# 2. 位置情報(緯度経度)と前回実施した緯度経度より
-#     移動した距離をオドメータ,トリップメータ
-#     として保存
-# 3. トリップメータのリセットはGPIO26で行う
-# 
-# 
-######################################################
-# 定数
+I2C_TEMP_ADDR = 0x5C
+KNOT = 1.852
+SERIAL_DEVIOCE = '/dev/serial0'
 POLE_RADIUS = 6356752.314245 					# 極半径
 EQUATOR_RADIUS = 6378137.0 						# 赤道半径
 METER_ID_TRIP_A = 1001
 METER_ID_TRIP_B = 1002
 METER_ID_ODO  = 2001
+STATUS_ID_TEMP = 1001
+STATUS_ID_HUM = 1002
+STATUS_ID_WDGT = 1003
+STATUS_ID_LEVEL = 1004
 
 
-# GPS情報
+# GPIO Setting
+GPIO.setmode(GPIO.BCM)
+## GPIO input
+GPIO_23_1PPS = 23
+
+logKm = 0
+
+
+
+
+
 gps = micropyGPS.MicropyGPS(9, 'dd')
+def runTemp():
+	# i2c
+	i2c = smbus.SMBus(1)
 
 
-#トリップメータ関連
-tripResetBtn = False
-tripResetStartDate = ""
-
-#最終ログ
-lastLon = "";
-lastLat = "";
-
-
-# SQLite 初期設定
-DB.init_DB()
-
-# GPS情報を読み込む
-def runGPS():
-	s = serial.Serial('/dev/serial0', 9600, timeout=10)
-	s.readline()
+	
+	try:
+		i2c.write_i2c_block_data(I2C_TEMP_ADDR,0x00,[])
+	except:
+		pass
+	
+	
 	while True:
-		sentence = s.readline().decode('utf-8')
-		if(sentence[0] != '$'):
-			continue
+		try:
+			i2c.write_i2c_block_data(I2C_TEMP_ADDR,0x03,[0x00,0x04])
+			time.sleep(0.25)
+			block = i2c.read_i2c_block_data(I2C_TEMP_ADDR,0,6)
+			hum = float(block[2] << 8 | block[3])/10
+			temp = float(block[4] << 8 | block[5]) / 10
 
-		for x in sentence:
-			gps.update(x)
+			wbgt = 0.7 * hum + 0.3 * temp
+			level = 0
+			if 31 <= wbgt :
+				level = 5
+			elif 30 <= wbgt and wbgt <= 28:
+				level = 4
+			elif 27 <= wbgt and wbgt <= 25:
+				level = 3
+			elif 24 <= wbgt and wbgt <= 21:
+				level = 2
+			else:
+				level = 1
 
-gpsthread = threading.Thread(target=runGPS)
-gpsthread.daemon = True
-gpsthread.start()
+
+			DB.updateState([(STATUS_ID_TEMP, str(temp))])
+			time.sleep(0.02)
+			DB.updateState([(STATUS_ID_HUM, str(hum))])
+			time.sleep(0.02)
+			DB.updateState([(STATUS_ID_WDGT, str(wbgt))])
+			time.sleep(0.02)
+			DB.updateState([(STATUS_ID_LEVEL, str(level))])
+			time.sleep(0.02)
+			
+			time.sleep(0.8)
+		except Exception as e:
+			print(e)
+			pass
 
 
+def main():
+	# SQLite 初期設定
+	DB.init_DB()
+	# シリアル通信設定
+	uart = serial.Serial('/dev/serial0', 9600, timeout=10)
+	# gps設定
+
+	tempThread = threading.Thread(target=runTemp, args=())
+	tempThread.daemon = True
+	tempThread.start() # スレッドを起動
+	
+
+	# GPIO setop
+	GPIO.setup(GPIO_23_1PPS, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+	time.sleep(0.003)
+
+	
+	logLat = 40.430001
+	logLon = 150.00001
+
+	uart.readline()
+
+	# 10秒ごとに表示
+	tm_last = 0
+	while True:
+		try:
+			sentence = uart.readline()
+			sentenceStr = sentence.decode('utf-8')
+
+			for x in sentenceStr:
+				gps.update(x)
+
+			gpio231PPS = GPIO.input(GPIO_23_1PPS)
 
 
-# 緯度経度から距離へ変換
-# @return float (km)
-def locationToKilometer(lon, lat):
-    # 緯度経度をラジアンに変換
-    lat_kamata = math.radians(lat[0])
-    lon_kamata = math.radians(lon[0])
-    lat_yokosukachuo = math.radians(lat[1])
-    lon_yokosukachuo = math.radians(lon[1])
+			if(sentenceStr.startswith("$GNRMC")):
+				gnrmc = sentenceStr.split(",")
+				#0  ヘッダー
+				#1  時刻
+				#2  ステータス
+				#3  緯度 (lat)
+				#4  N/S表記
+				#5  経度 (lon)
+				#6  E/W表記
+				#7  移動速度(knot)
+				#8  進行方向
+				#9  日付
+				#10 地磁気の偏角
+				#11 地磁気のE/W表記
+				#12 モード
+				#13 チェックサム
+				if gnrmc[2]=="A":
+					dateStr = "{0}/{1}/{2}".format(gps.date[0] + 2000,gps.date[1], gps.date[1])
+					hour = gps.timestamp[0] if gps.timestamp[1] < 24 else gps.timestamp[0] - 24
+					timeStr = "{0}:{1}:{2}".format(hour,gps.timestamp[1], gps.timestamp[2])
 
-    lat_difference = lat_kamata - lat_yokosukachuo       # 緯度差
-    lon_difference = lon_kamata - lon_yokosukachuo       # 経度差
-    lat_average = (lat_kamata + lat_yokosukachuo) / 2    # 平均緯度
+					speed = getTravelSpeed(float(gnrmc[7]))
+					if(speed != 0):
+						# 移動中
+						if(isSpeed(speed)):
+							logKm = speed
+							newStation = (gps.latitude[0], gps.longitude[0])
+							logStation = (logLat, logLon)
+							lat = gps.latitude[0]
+							lon = gps.longitude[0]
+							
+							# ログ保存
+							logLat = gps.latitude[0]
+							logLon = gps.longitude[0]
 
-    e2 = (math.pow(equator_radius, 2) - math.pow(pole_radius, 2)) \
-            / math.pow(equator_radius, 2)  # 第一離心率^2
+							# 移動距離算出
+							movementKm = geodesic(newStation, logStation).km
+							print(str(math.floor(movementKm) / 10) + " km/h")
+							DB.insertLog([(dateStr, timeStr, speed, lon, lat)])
 
-    w = math.sqrt(1- e2 * math.pow(math.sin(lat_average), 2))
+						else:
+							print("No movement 1")
+					else:
+						# 0kmの場合
+						# 現状何もしない
+						print("No movement 2")
 
-    m = equator_radius * (1 - e2) / math.pow(w, 3) # 子午線曲率半径
+					# 0KM END
+				# GNRMC STATUS A END
+			# GPS IF END
+			# TEMP
+			if gpio231PPS == 0:
+		except Exception as e:
+			print('Exception:', e)
+	# While End
+	
 
-    n = equator_radius / w                         # 卯酉線曲半径
+		
 
-    distance = math.sqrt(math.pow(m * lat_difference, 2) \
-                   + math.pow(n * lon_difference * math.cos(lat_average), 2)) # 距離計測
+def getTravelSpeed(knot):
+	return math.floor(knot * KNOT)
+# getTravelSpeed End
 
-    print(distance / 1000)
-    return (distance / 1000)
+def isSpeed(km):
+	if km == 0 and logKm == 0:
+		return False
+	else:
+		return True
+# isSpeed End
+
 
 
 if __name__ == "__main__":
-	while True:
-		km = 0.0
-		if gps.clean_sentences > 20:
-			#GPS情報から日時を取得
-			hour = gps.timestamp[0] if gps.timestamp[1] < 24 else gps.timestamp[0] - 24
-			dateStr = "{0}/{1}/{2}".format(gps.date[0] + 2000,gps.date[1], gps.date[1])
-			timeStr = "{0}:{1}:{2}".format(hour,gps.timestamp[1], gps.timestamp[2])
-
-			# GPS情報から緯度経度を算出
-			lat = gps.latitude_string().replace("' N", "").replace("' W", "").replace("°", "")
-			lon = gps.longitude_string().replace("' N", "").replace("' W", "").replace("°", "")
-
-
-			# 最終取得位置から移動距離を算出
-			if not (len(lastLat) == 0 and len(lastLon) == 0):
-				km = locationToKilometer([lon.replace('°','.').replace('\'',''), lastLon], [lat.replace('°','.').replace('\'',''), lastLat])
-			# IF End (len(lastLat))
-
-			print(gps.latitude_string() + "___" + gps.longitude_string())
-			# 最終取得位置を更新
-			lastLon = float(gps.latitude_string().replace("' N", "").replace("' W", "").replace("°", ""))
-			lastLat = float(gps.longitude_string().replace("' N", "").replace("' W", "").replace("°", ""))
-
-			# オドメーター取得
-			odoMeterLog = DB.selectMeter(METER_ID_ODO)
-
-			odoResult = float(odoMeterLog[0][0]) + km
-
-			# トリップメータ取得
-			tripA_MeterLog = DB.selectMeter(METER_ID_TRIP_A)
-			tripA_Result = float(tripA_MeterLog[0][0]) + km
-			
-
-			tripB_MeterLog = DB.selectMeter(METER_ID_TRIP_B)
-			tripB_Result = float(tripB_MeterLog[0][0]) + km
-			# 各情報をDBへ保存
-			DB.updateMeter([(odoResult, METER_ID_ODO),(tripA_Result, METER_ID_TRIP_A),(tripB_Result, METER_ID_TRIP_B)])
-			DB.insertLog([(dateStr, timeStr, lon, lat)])
-			
-		# IF End (clean_sentences)
-		# GPIO制御
-
-		# I2C制御
-
-		# USB制御
+	main()
