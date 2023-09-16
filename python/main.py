@@ -12,16 +12,19 @@ import DB
 import micropyGPS
 from geopy.distance import geodesic
 import threading
-
+import os
+import subprocess, shlex
 
 I2C_TEMP_ADDR = 0x5C
 KNOT = 1.852
 SERIAL_DEVIOCE = '/dev/serial0'
 POLE_RADIUS = 6356752.314245 					# 極半径
 EQUATOR_RADIUS = 6378137.0 						# 赤道半径
+
 METER_ID_TRIP_A = 1001
 METER_ID_TRIP_B = 1002
 METER_ID_ODO  = 2001
+
 STATUS_ID_TEMP = 1001
 STATUS_ID_HUM = 1002
 STATUS_ID_WDGT = 1003
@@ -32,6 +35,7 @@ STATUS_ID_LEVEL = 1004
 GPIO.setmode(GPIO.BCM)
 ## GPIO input
 GPIO_23_1PPS = 23
+GPIO_27_BATTERY = 27
 
 logKm = 0
 
@@ -82,38 +86,38 @@ def runTemp():
 			time.sleep(0.02)
 			DB.updateState([(STATUS_ID_LEVEL, str(level))])
 			time.sleep(0.02)
-			
 			time.sleep(0.8)
 		except Exception as e:
 			print(e)
 			pass
 
 
+
 def main():
 	# SQLite 初期設定
 	DB.init_DB()
 	# シリアル通信設定
-	uart = serial.Serial('/dev/serial0', 9600, timeout=10)
+	uart = serial.Serial('/dev/ttyUSB0', 9600, timeout=10)
 	# gps設定
 
 	tempThread = threading.Thread(target=runTemp, args=())
 	tempThread.daemon = True
-	tempThread.start() # スレッドを起動
-	
+#	tempThread.start() # スレッドを起動
 
 	# GPIO setop
 	GPIO.setup(GPIO_23_1PPS, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
+	GPIO.setup(GPIO_27_BATTERY, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+	GPIO.input(GPIO_27_BATTERY)
 	time.sleep(0.003)
+	log = DB.selectLastLog()
 
-	
-	logLat = 40.430001
-	logLon = 150.00001
+	if(len(log) !=0):
+		logLat = log[0][1]
+		logLon = log[0][0]
+
 
 	uart.readline()
 
-	# 10秒ごとに表示
-	tm_last = 0
 	while True:
 		try:
 			sentence = uart.readline()
@@ -122,10 +126,12 @@ def main():
 			for x in sentenceStr:
 				gps.update(x)
 
-			gpio231PPS = GPIO.input(GPIO_23_1PPS)
+			
 
 
 			if(sentenceStr.startswith("$GNRMC")):
+
+				# print(sentenceStr)
 				gnrmc = sentenceStr.split(",")
 				#0  ヘッダー
 				#1  時刻
@@ -147,9 +153,14 @@ def main():
 					timeStr = "{0}:{1}:{2}".format(hour,gps.timestamp[1], gps.timestamp[2])
 
 					speed = getTravelSpeed(float(gnrmc[7]))
+
 					if(speed != 0):
 						# 移動中
 						if(isSpeed(speed)):
+							if (log == None):
+								logLat = gps.latitude[0]
+								logLon = gps.longitude[0]
+
 							logKm = speed
 							newStation = (gps.latitude[0], gps.longitude[0])
 							logStation = (logLat, logLon)
@@ -165,6 +176,12 @@ def main():
 							print(str(math.floor(movementKm) / 10) + " km/h")
 							DB.insertLog([(dateStr, timeStr, speed, lon, lat)])
 
+							# 各メーターに保存
+							odoMeter = selectMeter(METER_ID_ODO)
+							tripAMeter = selectMeter(METER_ID_TRIP_A)
+							tripBMeter = selectMeter(METER_ID_TRIP_B)
+
+
 						else:
 							print("No movement 1")
 					else:
@@ -175,19 +192,23 @@ def main():
 					# 0KM END
 				# GNRMC STATUS A END
 			# GPS IF END
-			# TEMP
-			if gpio231PPS == 0:
+			bat = GPIO.input(GPIO_27_BATTERY)
+
+			if(bat == 0):
+				shutdown()
+			
 		except Exception as e:
 			print('Exception:', e)
 	# While End
 	
 
 		
-
+# Knot(ノット)から時速(km/h)へ変換
 def getTravelSpeed(knot):
 	return math.floor(knot * KNOT)
 # getTravelSpeed End
 
+# 移動速度を計算
 def isSpeed(km):
 	if km == 0 and logKm == 0:
 		return False
@@ -195,6 +216,11 @@ def isSpeed(km):
 		return True
 # isSpeed End
 
+
+def shutdown():
+	args = shlex.split("sudo shutdown -h now")
+	ret = subprocess.call(args)
+# shutdown end
 
 
 if __name__ == "__main__":
