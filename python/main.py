@@ -102,7 +102,7 @@ def main():
 
 	tempThread = threading.Thread(target=runTemp, args=())
 	tempThread.daemon = True
-#	tempThread.start() # スレッドを起動
+	tempThread.start() # スレッドを起動
 
 	# GPIO setop
 	GPIO.setup(GPIO_23_1PPS, GPIO.IN, pull_up_down=GPIO.PUD_UP)
