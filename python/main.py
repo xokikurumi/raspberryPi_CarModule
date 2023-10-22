@@ -77,7 +77,8 @@ def runTemp():
 			else:
 				level = 1
 
-
+			print(str(temp))
+			print(str(hum))
 			DB.updateState([(STATUS_ID_TEMP, str(temp))])
 			time.sleep(0.02)
 			DB.updateState([(STATUS_ID_HUM, str(hum))])
@@ -176,10 +177,14 @@ def main():
 							print(str(math.floor(movementKm) / 10) + " km/h")
 							DB.insertLog([(dateStr, timeStr, speed, lon, lat)])
 
+
 							# 各メーターに保存
 							odoMeter = selectMeter(METER_ID_ODO)
 							tripAMeter = selectMeter(METER_ID_TRIP_A)
 							tripBMeter = selectMeter(METER_ID_TRIP_B)
+							DB.updateMeter([(math.floor(movementKm) / 10 + odoMeter), METER_ID_ODO])
+							DB.updateMeter([(math.floor(movementKm) / 10 + tripAMeter), METER_ID_TRIP_A])
+							DB.updateMeter([(math.floor(movementKm) / 10 + tripBMeter), METER_ID_TRIP_B])
 
 
 						else:
@@ -219,7 +224,7 @@ def isSpeed(km):
 
 def shutdown():
 	args = shlex.split("sudo shutdown -h now")
-	ret = subprocess.call(args)
+	# ret = subprocess.call(args)
 # shutdown end
 
 
